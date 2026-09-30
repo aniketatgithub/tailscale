@@ -18,6 +18,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/netip"
@@ -47,6 +48,7 @@ import (
 	"tailscale.com/tstest/natlab/vnet"
 	"tailscale.com/types/key"
 	"tailscale.com/util/mak"
+	"tailscale.com/util/set"
 )
 
 var (
@@ -74,9 +76,9 @@ type Env struct {
 	// are downloaded from pkgs.tailscale.com instead of compiled from the tree.
 	testVersion string
 
-	// gokrazy-specific paths
-	gokrazyBase   string // path to gokrazy base qcow2 image
-	gokrazyKernel string // path to gokrazy kernel
+	// gokrazyKernel is the path to the gokrazy kernel. It's set by
+	// ensureGokrazy with gokrazyBuildMu held.
+	gokrazyKernel string
 
 	// tailmac-specific paths (macOS VMs)
 	tailmacDir        string // path to tailmac bin/ directory containing Host.app
@@ -96,12 +98,11 @@ type Env struct {
 
 	// Shared resource initialization (sync.Once for things multiple nodes share).
 	vnetOnce      sync.Once
-	gokrazyOnce   sync.Once
 	qemuSockOnce  sync.Once
 	dgramSockOnce sync.Once
 	compileMu     sync.Mutex
 	compileOnce   map[string]*sync.Once // keyed by goos_goarch
-	imageOnce     map[string]*sync.Once // keyed by OSImage.Name
+	imageOnce     map[string]*sync.Once // keyed by OSImage.Name (cloud and gokrazy images)
 
 	// Web UI support.
 	ctx        context.Context // cancelled when test ends
@@ -783,12 +784,23 @@ func (e *Env) Start() {
 				if err != nil {
 					return fmt.Errorf("[%s] tailscale up (limit %v): %w", n.name, tailscaleUpTimeout, err)
 				}
-				st2, err := n.agent.Status(ctx)
-				if err != nil {
-					return fmt.Errorf("[%s] status after up: %w", n.name, err)
-				}
-				if st2.BackendState != "Running" {
-					return fmt.Errorf("[%s] state = %q, want Running", n.name, st2.BackendState)
+				// "tailscale up" normally waits for the Running state,
+				// but a CLI built with ts_omit_ipnbus (as in
+				// GokrazyExtraSmall) can't watch for it and returns
+				// early, so poll briefly.
+				var st2 *ipnstate.Status
+				if err := tstest.WaitFor(30*time.Second, func() error {
+					var err error
+					st2, err = n.agent.Status(ctx)
+					if err != nil {
+						return err
+					}
+					if st2.BackendState != "Running" {
+						return fmt.Errorf("state = %q, want Running", st2.BackendState)
+					}
+					return nil
+				}); err != nil {
+					return fmt.Errorf("[%s] after up: %w", n.name, err)
 				}
 
 				// Apply any capabilities for the node to the map.
@@ -2119,43 +2131,111 @@ func (e *Env) RecvTaildropFile(ctx context.Context, n *Node) (name string, conte
 	return name, body
 }
 
-var buildGokrazy sync.Once
+var (
+	// gokrazyBuildMu serializes gokrazy image builds, which share the
+	// gokrazy directory, and guards gokrazyBuilt.
+	gokrazyBuildMu sync.Mutex
 
-// ensureGokrazy builds the gokrazy base image (once per test process) and
-// locates the kernel. The build is fast (~4s) so we always rebuild to ensure
-// the baked-in binaries (tta, tailscale, tailscaled) match the current source.
-func (e *Env) ensureGokrazy(ctx context.Context) error {
-	if e.gokrazyBase != "" {
-		return nil // already found
+	// gokrazyBuilt is the set of gokrazy image names that this process
+	// has already built successfully.
+	gokrazyBuilt set.Set[string]
+)
+
+// GokrazyImages returns the gokrazy OS images that natlab builds from
+// source: [Gokrazy] and its minimal-feature variants. It is intended for
+// tooling such as a CI prep step that wants to prebuild them.
+func GokrazyImages() []OSImage {
+	return []OSImage{Gokrazy, GokrazyExtraSmall, GokrazyNoNATTraversal, GokrazyDERPOnly}
+}
+
+// BuildGokrazyImage builds the gokrazy image img from the current source
+// tree, writing its qcow2 file into the gokrazy directory, unless this
+// process has already built it. Build output goes to os.Stdout and
+// os.Stderr. It is safe for concurrent use.
+func BuildGokrazyImage(ctx context.Context, img OSImage) error {
+	gokrazyBuildMu.Lock()
+	defer gokrazyBuildMu.Unlock()
+	return buildGokrazyImageLocked(ctx, img)
+}
+
+func buildGokrazyImageLocked(ctx context.Context, img OSImage) error {
+	if !img.IsGokrazy {
+		return fmt.Errorf("%s is not a gokrazy image", img.Name)
 	}
-
+	if gokrazyBuilt.Contains(img.Name) {
+		return nil
+	}
 	modRoot, err := findModRoot()
 	if err != nil {
 		return err
 	}
-
-	var buildErr error
-	buildGokrazy.Do(func() {
-		e.t.Logf("building gokrazy natlab image...")
-		cmd := exec.CommandContext(ctx, "make", "natlab")
-		cmd.Dir = filepath.Join(modRoot, "gokrazy")
-		cmd.Stderr = os.Stderr
-		cmd.Stdout = os.Stdout
-		if err := cmd.Run(); err != nil {
-			buildErr = fmt.Errorf("make natlab: %w", err)
-		}
-	})
-	if buildErr != nil {
-		return buildErr
+	args, _ := img.gokrazyMakeArgs()
+	if img.gokrazyKeep != nil {
+		log.Printf("building %s image (keeping only features %v)...", img.Name, img.gokrazyKeep)
+	} else {
+		log.Printf("building %s image...", img.Name)
 	}
+	cmd := exec.CommandContext(ctx, "make", args...)
+	cmd.Dir = filepath.Join(modRoot, "gokrazy")
+	cmd.Stderr = os.Stderr
+	cmd.Stdout = os.Stdout
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("make %s: %w", args[0], err)
+	}
+	gokrazyBuilt.Make()
+	gokrazyBuilt.Add(img.Name)
+	return nil
+}
 
-	e.gokrazyBase = filepath.Join(modRoot, "gokrazy/natlabapp.qcow2")
-
-	kernel, err := findKernelPath(filepath.Join(modRoot, "go.mod"))
+// ensureGokrazy builds the gokrazy image img (once per test process) and
+// locates the kernel. It returns the path to img's base qcow2 image.
+// The build is fast (~4s) so we always rebuild to ensure the baked-in
+// binaries (tta, tailscale, tailscaled) match the current source.
+// It is safe for concurrent use.
+func (e *Env) ensureGokrazy(ctx context.Context, img OSImage) (basePath string, err error) {
+	modRoot, err := findModRoot()
 	if err != nil {
-		return fmt.Errorf("finding kernel: %w", err)
+		return "", err
 	}
-	e.gokrazyKernel = kernel
+	_, qcow2 := img.gokrazyMakeArgs()
+
+	e.compileMu.Lock()
+	once, ok := e.imageOnce[img.Name]
+	if !ok {
+		once = new(sync.Once)
+		mak.Set(&e.imageOnce, img.Name, once)
+	}
+	e.compileMu.Unlock()
+
+	once.Do(func() {
+		step := e.Step(fmt.Sprintf("Build %s image", img.Name))
+		step.Begin()
+		err = e.buildGokrazy(ctx, modRoot, img)
+		step.End(err)
+	})
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(modRoot, "gokrazy", qcow2), nil
+}
+
+// buildGokrazy builds the gokrazy image img, unless this process already
+// has, and sets e.gokrazyKernel.
+func (e *Env) buildGokrazy(ctx context.Context, modRoot string, img OSImage) error {
+	gokrazyBuildMu.Lock()
+	defer gokrazyBuildMu.Unlock()
+
+	if err := buildGokrazyImageLocked(ctx, img); err != nil {
+		return err
+	}
+
+	if e.gokrazyKernel == "" {
+		kernel, err := findKernelPath(filepath.Join(modRoot, "go.mod"))
+		if err != nil {
+			return fmt.Errorf("finding kernel: %w", err)
+		}
+		e.gokrazyKernel = kernel
+	}
 	return nil
 }
 

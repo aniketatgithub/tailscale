@@ -23,6 +23,7 @@ import (
 
 	shellquote "github.com/kballard/go-shellquote"
 	"github.com/peterbourgon/ff/v3/ffcli"
+	"tailscale.com/client/local"
 	"tailscale.com/feature/buildfeatures"
 	_ "tailscale.com/feature/condregister/awsparamstore"
 	_ "tailscale.com/feature/condregister/identityfederation"
@@ -608,21 +609,19 @@ func runUp(ctx context.Context, cmd string, args []string, upArgs upArgsT) (retE
 		}
 	}()
 
-	if !buildfeatures.HasIPNBus {
-		fmt.Fprintln(Stderr, "binary built with ts_omit_ipnbus; not waiting for completion")
-		return nil
-	}
-
 	// Start watching the IPN bus before we call Start() or StartLoginInteractive(),
 	// or we could miss IPN notifications.
 	//
 	// In particular, if we're doing a force-reauth, we could miss the
 	// notification with the auth URL we should print for the user.
-	watcher, err := localClient.WatchIPNBus(watchCtx, 0)
-	if err != nil {
-		return err
+	var watcher *local.IPNBusWatcher
+	if buildfeatures.HasIPNBus {
+		watcher, err = localClient.WatchIPNBus(watchCtx, 0)
+		if err != nil {
+			return err
+		}
+		defer watcher.Close()
 	}
-	defer watcher.Close()
 
 	// Special case: bare "tailscale up" means to just start
 	// running, if there's ever been a login.
@@ -698,6 +697,11 @@ func runUp(ctx context.Context, cmd string, args []string, upArgs upArgsT) (retE
 				return err
 			}
 		}
+	}
+
+	if !buildfeatures.HasIPNBus {
+		fmt.Fprintln(Stderr, "binary built with ts_omit_ipnbus; not waiting for completion")
+		return nil
 	}
 
 	upComplete := make(chan bool, 1)
