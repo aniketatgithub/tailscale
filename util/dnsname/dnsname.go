@@ -58,8 +58,10 @@ func ToFQDN(s string) (FQDN, error) {
 	}
 
 	st := 0
-	for i := range len(s) {
-		if s[i] != '.' {
+	// Check every label, including the final one, which has no dot after
+	// it once the trailing dot is trimmed above.
+	for i := 0; i <= len(s); i++ {
+		if i < len(s) && s[i] != '.' {
 			continue
 		}
 		label := s[st:i]
@@ -71,8 +73,11 @@ func ToFQDN(s string) (FQDN, error) {
 		// set is used.
 		//
 		// See https://github.com/tailscale/tailscale/issues/2024 for more.
-		if len(label) == 0 || len(label) > maxLabelLength {
+		if len(label) == 0 {
 			return "", vizerror.Errorf("%q is not a valid DNS label", label)
+		}
+		if len(label) > maxLabelLength {
+			return "", vizerror.Errorf("%q is too long, max length is %d bytes", label, maxLabelLength)
 		}
 		st = i + 1
 	}

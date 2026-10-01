@@ -82,6 +82,32 @@ func TestToFQDNRejectsLineUnsafeCharacters(t *testing.T) {
 	}
 }
 
+// TestToFQDNRejectsBadFinalLabel checks that the last label of a name,
+// which has no dot after it, is validated like every other label.
+// See https://github.com/tailscale/tailscale/issues/21528.
+func TestToFQDNRejectsBadFinalLabel(t *testing.T) {
+	long := strings.Repeat("a", 64) // one over the 63-byte label limit
+	for _, in := range []string{
+		long,
+		long + ".",
+		"com." + long,
+		"com." + long + ".",
+		"foo..",
+		"foo.com..",
+	} {
+		if got, err := ToFQDN(in); err == nil {
+			t.Errorf("ToFQDN(%q) = %q, nil; want error", in, got)
+		}
+	}
+
+	ok := strings.Repeat("a", 63)
+	for _, in := range []string{ok, ok + ".", "com." + ok, "com." + ok + "."} {
+		if _, err := ToFQDN(in); err != nil {
+			t.Errorf("ToFQDN(%q) = %v; want nil error", in, err)
+		}
+	}
+}
+
 func TestFQDNTooLong(t *testing.T) {
 	// RFC 1035 says a dns name has a max size of 255 octets, and is represented as labels of len+ASCII chars so
 	//   example.com
